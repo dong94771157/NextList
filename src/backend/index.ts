@@ -3,6 +3,7 @@ import { setupRouter } from "./server/router"
 import { rawRouter } from "./server/raw"
 import { webdavRouter } from "./server/webdav"
 import { setEnvCtx } from "./internal/model/db"
+import "../../loadEnv.js"
 
 const app = new Hono()
 

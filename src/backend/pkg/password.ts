@@ -85,7 +85,15 @@ export async function verifyUserPassword(
     // 再判断是否是明文（直接登录）。
     const staticHex = isHex64(plain) ? plain : await staticHash(plain)
     const expected = await saltedHash(staticHex, user.salt)
-    return expected === user.password
+    if (expected === user.password) return true
+    // 兼容历史迁移 bug：旧版登录成功迁移把已静态哈希的凭证（/login/hash 提交值）
+    // 当作明文再 staticHash 一次，使存储值变成 saltedHash(staticHash(staticHex), salt)。
+    // 接受这种过哈希形式以便受损账号仍能登录，登录成功后由调用方重写为正确格式。
+    const overHashed = await saltedHash(
+      await staticHash(staticHex),
+      user.salt,
+    )
+    return overHashed === user.password
   }
   // 历史单层：password == staticHash(plain)
   const staticHex = isHex64(plain) ? plain : await staticHash(plain)

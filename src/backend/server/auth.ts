@@ -14,7 +14,13 @@ import {
   buildQrImageUrl,
 } from "../pkg/totp"
 import { getJwtSecret, revokeToken, isTokenRevoked } from "./middlewares"
-import { staticHash, setUserPassword } from "../pkg/password"
+import {
+  staticHash,
+  setUserPassword,
+  isHex64,
+  saltedHash,
+  generateSalt,
+} from "../pkg/password"
 import { setCSRFToken, clearCSRFToken } from "../pkg/csrf"
 import { getAuditLogger } from "../pkg/audit"
 
@@ -280,7 +286,7 @@ export async function validateUserPassword(
   // bootstrap admin/admin 默认值兼容
   const defaultAdminHash = await staticHash("admin")
   if (stored === "" || stored === "admin" || stored === defaultAdminHash) {
-    return rawPassword === "admin"
+    return rawPassword === "admin" || rawPassword === defaultAdminHash
   }
   return false
 }
@@ -313,10 +319,12 @@ meRouter.use("*", async (c, next) => {
 // Ensure admin/guest users exist in DB KV space with a default password if unset.
 async function getOrInitUsers(envCtx: any) {
   const db = await getDb(envCtx)
+  const adminUsername = envCtx?.ADMIN_USERNAME || process.env.ADMIN_USERNAME || "admin"
+  const adminPassword = envCtx?.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || "admin"
   if (!db.users || db.users.length === 0) {
     const admin: any = {
       id: 1,
-      username: "admin",
+      username: adminUsername,
       password: "",
       role: 2,
       permission: 0,
@@ -326,7 +334,7 @@ async function getOrInitUsers(envCtx: any) {
       allow_ldap: false,
       pwd_update_at: new Date().toISOString(),
     }
-    await setUserPassword(admin, "admin")
+    await setUserPassword(admin, adminPassword)
     db.users = [
       admin,
       {
@@ -345,6 +353,17 @@ async function getOrInitUsers(envCtx: any) {
       },
     ]
     await saveDb(db, envCtx)
+  } else {
+    const adminUser = db.users.find((u: any) => u.username === adminUsername)
+    // password 为空或缺失（如种子数据 db.json 无该字段）时，用环境变量口令初始化
+    if (adminUser && !adminUser.salt && !adminUser.password) {
+      await setUserPassword(adminUser, adminPassword)
+      const idx = (db.users || []).findIndex((u: any) => u.id === adminUser.id)
+      if (idx !== -1) {
+        db.users[idx] = adminUser
+        await saveDb(db, envCtx)
+      }
+    }
   }
   return { db, users: db.users }
 }
@@ -397,22 +416,32 @@ async function issueSession(c: any, user: any) {
   return { token, csrf_token: csrfToken, role: user.role }
 }
 
-// 登录成功后：清除防爆破计数，并将旧单层哈希迁移为带 salt 的双层哈希。
+// 登录成功后：清除防爆破计数，并将存储口令统一归一化为正确的双层（带 salt）格式。
+// 旧单层格式（无 salt）与被历史迁移 bug 污染的过哈希值都在此修复。
 async function finalizeLoginSuccess(
   c: any,
   matchedUser: any,
   rawPassword: string,
 ) {
   await clearLoginFailures(c, matchedUser.username, c.env)
-  // 无 salt 的历史单层格式 -> 迁移为双层（带 per-user 盐）
-  if (!matchedUser.salt) {
-    await setUserPassword(matchedUser, rawPassword)
-    const db = await getDb(c.env)
-    const idx = (db.users || []).findIndex((u: any) => u.id === matchedUser.id)
-    if (idx !== -1) {
-      db.users[idx] = matchedUser
-      await saveDb(db, c.env)
-    }
+  // rawPassword 可能是明文（/login）或前端静态哈希（/login/hash），
+  // 不能交给 setUserPassword——它会把已哈希值当明文再 staticHash 一次。
+  const staticHex = isHex64(rawPassword)
+    ? rawPassword
+    : await staticHash(rawPassword)
+  const salt = matchedUser.salt || generateSalt()
+  const correctHash = await saltedHash(staticHex, salt)
+  if (matchedUser.password === correctHash && matchedUser.salt === salt) {
+    return
+  }
+  matchedUser.salt = salt
+  matchedUser.password = correctHash
+  matchedUser.pwd_update_at = new Date().toISOString()
+  const db = await getDb(c.env)
+  const idx = (db.users || []).findIndex((u: any) => u.id === matchedUser.id)
+  if (idx !== -1) {
+    db.users[idx] = matchedUser
+    await saveDb(db, c.env)
   }
 }
 
